@@ -1,0 +1,11 @@
+[project]
+name = "telegram-to-cloud"
+version = "0.1.0"
+description = "Simple Telegram Bot to upload/manage files to your VPS/cloud instances"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyrogram>=2.0.106",
+    "python-dotenv>=1.2.1",
+    "tgcrypto>=1.2.5",
+]
