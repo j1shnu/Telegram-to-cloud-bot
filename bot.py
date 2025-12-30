@@ -166,5 +166,4 @@ async def progress_callback(current, total, message):
 
 if __name__ == "__main__":
     print("Bot started...")
-    utils.ensure_upload_dir(config.UPLOAD_DIR)
     app.run()
