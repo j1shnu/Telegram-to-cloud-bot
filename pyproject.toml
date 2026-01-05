@@ -8,4 +8,5 @@ dependencies = [
     "pyrogram>=2.0.106",
     "python-dotenv>=1.2.1",
     "tgcrypto>=1.2.5",
+    "aria2p>=0.12.0",
 ]

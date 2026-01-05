@@ -3,8 +3,12 @@ import time
 import utils
 import config
 import logging
+from urllib.parse import urlparse
 from pyrogram.types import Message
 from pyrogram import Client, filters
+
+import aria2p
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +22,19 @@ app = Client(
     bot_token=config.BOT_TOKEN
 )
 
+# Initialize Aria2
+# Fixed to Use localhost/port directly since config URL parsing might be brittle with aria2p
+
+parsed_url = urlparse(config.ARIA2_RPC_URL)
+
+aria2 = aria2p.API(
+    aria2p.Client(
+        host=f"{parsed_url.scheme}://{parsed_url.hostname}",
+        port=parsed_url.port or 6800,
+        secret=config.ARIA2_RPC_SECRET
+    )
+)
+
 # Auth Filter
 async def is_admin(_, __, message: Message):
     if not config.ADMIN_IDS:
@@ -26,16 +43,221 @@ async def is_admin(_, __, message: Message):
 
 admin_filter = filters.create(is_admin)
 
+@app.on_message(filters.command("torr") & admin_filter)
+async def torr_command(client, message):
+    if not message.reply_to_message:
+        await message.reply_text("Please reply to a message containing the magnet link.")
+        return
+
+    magnet_link = message.reply_to_message.text or message.reply_to_message.caption
+    
+    if not magnet_link:
+       await message.reply_text("No text found in the replied message.")
+       return
+
+    # Basic check for magnet link
+    if not magnet_link.strip().startswith("magnet:?"):
+        await message.reply_text("That doesn't look like a magnet link.")
+        return
+
+    status_msg = await message.reply_text("Adding to queue...")
+
+    try:
+        # Add to aria2 with specific download dir (internal to container)
+        download = await asyncio.to_thread(
+            aria2.add_magnet, 
+            magnet_link, 
+            {"dir": "/downloads"}
+        )
+    except Exception as e:
+        await status_msg.edit_text(f"Error adding to aria2: {e}")
+        return
+
+    gid = download.gid
+    previous_msg = ""
+    
+    while True:
+        try:
+            download = await asyncio.to_thread(aria2.get_download, gid)
+            status = download.status
+            
+            # Handle Metadata -> Real Download transition
+            if status == "complete" and download.followed_by:
+                await status_msg.edit_text("Metadata acquired. Switching to file download...")
+                new_gid = download.followed_by[0]
+                logger.info(f"Metadata switch: raw new_gid type={type(new_gid)}")
+                
+                # STRICT extraction of GID string
+                if isinstance(new_gid, str):
+                    gid = new_gid
+                elif hasattr(new_gid, 'gid'):
+                    gid = str(new_gid.gid)
+                else:
+                    gid = str(new_gid)
+                
+                # Double check: Ensure it is a pure string
+                if not isinstance(gid, str):
+                    logger.error(f"CRITICAL: gid is after conversion is {type(gid)}")
+                    gid = str(gid)
+
+                logger.info(f"Metadata switch: FINAL Resolved gid='{gid}' (type={type(gid)})")
+                    
+                # Force refresh of variable for next loop
+                continue
+
+            if status == "active":
+                update_text = (
+                    f"Downloading: `{download.name}`\n"
+                    f"Progress: {download.progress_string()}\n"
+                    f"Speed: {download.download_speed_string()}\n"
+                    f"ETA: {download.eta_string()}"
+                )
+                
+                # Rate limit updates slightly/check for changes
+                if update_text != previous_msg:
+                    try:
+                        await status_msg.edit_text(update_text)
+                        previous_msg = update_text
+                    except:
+                        pass
+            
+            elif status == "complete":
+                await status_msg.edit_text(f"Download Complete: `{download.name}`")
+                
+                # Optional: Force verify file existence in mapped dir
+                # Filename might be slightly different on disk, but generally matches download.name
+                # Note: utils.get_files checks config.UPLOAD_DIR which is mapped to local ./downloads
+                break
+                
+            elif status == "error":
+                await status_msg.edit_text(f"Download Error: {download.error_message}")
+                break
+            
+            elif status == "removed":
+                await status_msg.edit_text("Download Removed from Aria2.")
+                break
+            
+            await asyncio.sleep(3)
+        
+        except asyncio.CancelledError:
+            logger.info("Task Cancelled. Exiting loop.")
+            raise
+        except Exception as e:
+            logger.error(f"Polling error details: {e}, GID type: {type(gid)}")
+            await asyncio.sleep(3)
+
+@app.on_message(filters.command("kill") & admin_filter)
+async def kill_bot(client, message):
+    await message.reply_text("Stopping bot...")
+    os._exit(0) # Force exit to ensure process death
+
+# Global cache for torrent list index -> GID
+TORRENT_LIST_CACHE = {}
+
+# Helper to update cache and get list
+async def get_torrent_list_text():
+    try:
+        downloads = await asyncio.to_thread(aria2.get_downloads)
+        
+        if not downloads:
+            TORRENT_LIST_CACHE.clear()
+            return "No active or pending downloads."
+            
+        response_lines = ["**Active Downloads:**"]
+        TORRENT_LIST_CACHE.clear()
+        
+        for i, download in enumerate(downloads, 1):
+            TORRENT_LIST_CACHE[i] = download.gid
+            name = download.name or "Metadata"
+            status = download.status
+            progress = download.progress_string()
+            speed = download.download_speed_string()
+            
+            line = f"{i}. `{name}` [{status}] - {progress} ({speed})"
+            response_lines.append(line)
+            
+        return "\n".join(response_lines)
+    except Exception as e:
+        return f"Error fetching downloads: {e}"
+
+@app.on_message(filters.command("lstorr") & admin_filter)
+async def list_torrents(client, message):
+    text = await get_torrent_list_text()
+    await message.reply_text(text)
+
+@app.on_message(filters.command("stoptorr") & admin_filter)
+async def stop_torrent(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /stoptorr <index>")
+        return
+        
+    try:
+        index = int(message.command[1])
+        gid = TORRENT_LIST_CACHE.get(index)
+        
+        if not gid:
+            await message.reply_text("Invalid index. Please run /lstorr first.")
+            return
+            
+        await asyncio.to_thread(aria2.client.pause, gid)
+        await message.reply_text(f"Paused torrent #{index}")
+        
+    except ValueError:
+        await message.reply_text("Invalid index format.")
+    except Exception as e:
+        await message.reply_text(f"Error stopping torrent: {e}")
+
+@app.on_message(filters.command("deltorr") & admin_filter)
+async def delete_torrent(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /deltorr <index>")
+        return
+        
+    try:
+        index = int(message.command[1])
+        gid = TORRENT_LIST_CACHE.get(index)
+        
+        if not gid:
+            await message.reply_text("Invalid index. Please run /lstorr first.")
+            return
+            
+        # Try to remove. If it fails (e.g. already complete), try removing the result.
+        try:
+            await asyncio.to_thread(aria2.client.force_remove, gid)
+            await message.reply_text(f"Removed active torrent #{index}")
+        except Exception as e:
+            if "Active Download not found" in str(e):
+                # Likely complete or error, try removing result
+                await asyncio.to_thread(aria2.client.remove_download_result, gid)
+                await message.reply_text(f"Removed completed/stopped torrent #{index}")
+            else:
+                raise e
+        
+        # Show updated list
+        text = await get_torrent_list_text()
+        await message.reply_text(text)
+        
+    except ValueError:
+        await message.reply_text("Invalid index format.")
+    except Exception as e:
+        await message.reply_text(f"Error removing torrent: {e}")
+
 @app.on_message(filters.command("start") & admin_filter)
 async def start(client, message):
     await message.reply_text(
         "Welcome to **Telegram File Manager Bot!**\n"
-        "__Send me any file and reply `/upload` to upload it to the VPS.\n\n__"
-        "Commands:\n"
+        "__I can handle file uploads and torrent downloads.\n\n__"
+        "**Commands:**\n"
         "/start - Start the bot\n"
-        "/upload - Upload file\n"
+        "/upload - Upload file (reply to file)\n"
         "/ls - List files\n"
         "/del <filename> - Delete file\n"
+        "\n**Torrent Commands:**\n"
+        "/torr - Download torrent (reply to magnet)\n"
+        "/lstorr - List torrents\n"
+        "/stoptorr <index> - Stop torrent\n"
+        "/deltorr <index> - Delete torrent\n"
+        "/kill - Force stop bot\n"
     )
 
 @app.on_message(filters.command("ls") & admin_filter)
@@ -61,7 +283,7 @@ async def list_files(client, message):
 @app.on_message(filters.command("del") & admin_filter)
 async def delete_file(client, message):
     if len(message.command) < 2:
-        await message.reply_text("Usage: /del <filename>")
+        await message.reply_text("Usage: /del filename")
         return
     
     filename = message.command[1]
